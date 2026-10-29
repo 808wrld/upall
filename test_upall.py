@@ -1,7 +1,11 @@
-"""upall 纯函数单测。fixture 均为 2026-07-15 本机真实输出样例。
+"""Unit tests for upall's pure functions. Fixtures are real command output recorded on 2026-07-15.
 
-运行：uv run --with pytest --with rich pytest -q test_upall.py
+Run: uv run --with pytest --with rich pytest -q test_upall.py
 """
+import sys
+
+import pytest
+
 import upall
 
 
@@ -29,8 +33,8 @@ def test_parse_brew_outdated():
     items = upall.parse_brew_outdated(BREW_SAMPLE)
     assert [(i.pkg, i.current, i.latest) for i in items] == [
         ("c-ares", "1.34.6", "1.34.8"),   # formula
-        ("codexbar", "0.41.0", "0.43.0"),  # cask 也纳入
-    ]  # pinned-pkg 被排除
+        ("codexbar", "0.41.0", "0.43.0"),  # casks are included
+    ]  # pinned-pkg is excluded
 
 
 NPM_SAMPLE = """
@@ -50,11 +54,11 @@ def test_parse_npm_outdated_excludes_npm_itself():
     assert [(i.pkg, i.current, i.latest) for i in items] == [
         ("@jackwener/opencli", "1.8.4", "1.8.6"),
         ("undici", "8.5.0", "8.7.0"),
-    ]  # npm 自身随 brew 的 node 走，排除
+    ]  # npm itself ships with brew's node, so it's excluded
 
 
 def test_parse_npm_outdated_empty_output():
-    assert upall.parse_npm_outdated("") == []      # 无过期包时 npm 可能输出空
+    assert upall.parse_npm_outdated("") == []      # npm may print nothing when nothing is outdated
     assert upall.parse_npm_outdated("{}") == []
 
 
@@ -103,12 +107,12 @@ def test_parse_pypi_version():
 
 def test_diff_versions():
     installed = [("a", "1.0"), ("b", "2.0"), ("c", "3.0")]
-    latest = {"a": "1.0", "b": "2.1", "c": None}  # None = PyPI 查询失败
+    latest = {"a": "1.0", "b": "2.1", "c": None}  # None = PyPI lookup failed
     items = upall.diff_versions(installed, latest)
     assert [(i.pkg, i.current, i.latest) for i in items] == [
-        ("b", "2.0", "2.1"),  # 不等 → 可升级
-        ("c", "3.0", "?"),    # 查询失败 → 显示 ?，调用方不将其纳入升级
-    ]  # a 相等 → 不出现
+        ("b", "2.0", "2.1"),  # different -> upgradable
+        ("c", "3.0", "?"),    # lookup failed -> shown as ?, never upgraded by the caller
+    ]  # a is equal -> not listed
 
 
 def test_parse_github_release_tag():
@@ -144,7 +148,7 @@ def test_parse_apt_upgradable():
     assert [(i.pkg, i.current, i.latest) for i in items] == [
         ("gzip", "1.12-1ubuntu3.1", "1.12-1ubuntu3.2"),
         ("tar", "1.35+dfsg-3build1", "1.35+dfsg-3ubuntu0.2"),
-    ]  # Listing... 头行跳过
+    ]  # the 'Listing...' header is skipped
 
 
 def test_parse_apt_upgradable_empty():
@@ -166,7 +170,7 @@ def test_parse_dnf_check_update():
     assert [(i.pkg, i.current, i.latest) for i in items] == [
         ("xz", "1:5.8.1-4.fc40", "1:5.8.1-4.fc41"),
         ("xz-libs", "1:5.8.1-4.fc40", "1:5.8.1-4.fc41"),
-    ]  # Obsoleting Packages 段忽略；.arch 后缀剥离
+    ]  # 'Obsoleting Packages' section ignored; .arch suffix stripped
 
 
 def test_parse_dnf_check_update_unknown_current():
@@ -181,3 +185,73 @@ def test_parse_pacman_outdated():
         ("pacman", "6.0.2-5", "6.0.2-6"),
     ]
     assert upall.parse_pacman_outdated("") == []
+
+
+def test_diff_versions_skips_installs_ahead_of_latest():
+    installed = [("ruff", "0.6.0rc1"), ("tool", "2.0.0"), ("pre", "1.0.0rc1"), ("odd", "main")]
+    latest = {"ruff": "0.5.9", "tool": "1.9.9", "pre": "1.0.0", "odd": "1.0"}
+    items = upall.diff_versions(installed, latest)
+    assert [(i.pkg, i.current, i.latest) for i in items] == [
+        ("pre", "1.0.0rc1", "1.0.0"),  # same release, pre-release installed -> still upgradable
+        ("odd", "main", "1.0"),        # unparseable -> falls back to plain inequality
+    ]  # ruff / tool are ahead of the published release -> not listed
+
+
+@pytest.mark.parametrize(
+    ("current", "latest", "ahead"),
+    [
+        ("1.2.10", "1.2.9", True),
+        ("1.2", "1.2.0", False),
+        ("v2.0", "1.9", True),
+        ("1.3.14", "1.3.14", False),
+        ("1.0", "?", False),
+    ],
+)
+def test_installed_is_ahead(current, latest, ahead):
+    assert upall.installed_is_ahead(current, latest) is ahead
+
+
+DNF_WRAPPED_SAMPLE = """python3-some-really-long-package-name-devel.x86_64
+                         3.12.1-1.fc41            updates
+xz.x86_64 5.8.1-4.fc41 updates
+"""
+
+
+def test_parse_dnf_check_update_joins_wrapped_lines():
+    items = upall.parse_dnf_check_update(DNF_WRAPPED_SAMPLE, installed={"xz": "5.8.1-3.fc41"})
+    assert [(i.pkg, i.current, i.latest) for i in items] == [
+        ("python3-some-really-long-package-name-devel", "?", "3.12.1-1.fc41"),
+        ("xz", "5.8.1-3.fc41", "5.8.1-4.fc41"),
+    ]
+
+
+def test_output_tail_keeps_last_lines_and_final_progress_state():
+    tail = upall.OutputTail(3)
+    tail.feed("one\ntwo\nprogress 10%\rprogress 100%\nfou")
+    tail.feed("r\nKeep conffile? [Y/n] ")
+    assert tail.text() == "progress 100%\nfour\nKeep conffile? [Y/n]"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses sh")
+def test_stream_returns_exit_code_and_tail_including_unterminated_prompt():
+    code, tail = upall.stream(["sh", "-c", "echo first; printf 'Continue? [Y/n] '; exit 3"])
+    assert code == 3
+    assert tail == "first\nContinue? [Y/n]"
+
+
+def test_stream_passes_extra_env():
+    code, tail = upall.stream(["sh", "-c", 'echo "$UPALL_TEST_VAR"'], env={"UPALL_TEST_VAR": "hello"})
+    assert (code, tail) == (0, "hello")
+
+
+class _MissingAdapter(upall.Adapter):
+    name = "dnf"
+
+    def available(self) -> bool:
+        return False
+
+
+def test_main_reports_requested_manager_that_is_not_installed(monkeypatch, capsys):
+    monkeypatch.setattr(upall, "ADAPTERS", [_MissingAdapter()])
+    monkeypatch.setattr(sys, "argv", ["upall", "dnf"])
+    assert upall.main() == 1
