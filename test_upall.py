@@ -255,3 +255,27 @@ def test_main_reports_requested_manager_that_is_not_installed(monkeypatch, capsy
     monkeypatch.setattr(upall, "ADAPTERS", [_MissingAdapter()])
     monkeypatch.setattr(sys, "argv", ["upall", "dnf"])
     assert upall.main() == 1
+
+
+def test_output_tail_keeps_crlf_terminated_lines():
+    tail = upall.OutputTail(3)
+    tail.feed("first\r\nsecond\r\n")
+    assert tail.text() == "first\nsecond"
+
+
+def test_display_newlines_splits_progress_redraws_and_crlf():
+    d = upall.DisplayNewlines()
+    shown = d.feed("10%\r20%\r") + d.feed("\nnext\r\nlast\r") + d.flush()
+    assert shown == "10%\n20%\nnext\nlast\n"
+
+
+def test_display_newlines_handles_crlf_split_across_chunks():
+    d = upall.DisplayNewlines()
+    assert d.feed("line\r") + d.feed("\nmore") == "line\nmore"
+    assert d.flush() == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses sh")
+def test_stream_progress_output_tail_keeps_final_state():
+    code, tail = upall.stream(["sh", "-c", r"printf 'dl 10%%\rdl 100%%\r\ndone\r\n'"])
+    assert (code, tail) == (0, "dl 100%\ndone")

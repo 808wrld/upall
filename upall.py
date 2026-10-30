@@ -34,8 +34,12 @@ BREW_UPDATE_TIMEOUT = 120  # `brew update` is the slowest step (it pulls git)
 CMD_TIMEOUT = 30           # every other subcommand
 PYPI_TIMEOUT = 10          # a single PyPI / GitHub lookup
 
-# apt runs non-interactively: keep existing config files instead of stopping at
-# dpkg's "keep or replace conffile?" prompt, and abort rather than remove packages.
+# apt upgrades keep existing config files instead of stopping at dpkg's "keep or
+# replace conffile?" prompt, and abort rather than remove packages. These are
+# command-line options, so they also apply through sudo.
+# DEBIAN_FRONTEND additionally silences debconf questions, but only when it
+# reaches apt: as root it always does; through sudo, the default env_reset
+# drops it, and any remaining prompt is shown and can be answered.
 APT_ENV = {"DEBIAN_FRONTEND": "noninteractive"}
 APT_UPGRADE_OPTS = [
     "--no-remove",
@@ -292,8 +296,9 @@ class OutputTail:
             self._add(line)
 
     def _add(self, line: str) -> None:
-        # Progress bars redraw with "\r": keep only the final state of the line.
-        line = line.rsplit("\r", 1)[-1].rstrip()
+        # Drop a CRLF line ending first, then keep only the final state of a
+        # progress line that redraws itself with "\r".
+        line = line.rstrip("\r").rsplit("\r", 1)[-1].rstrip()
         if line:
             self._lines.append(line)
 
@@ -302,6 +307,31 @@ class OutputTail:
             self._add(self._partial)
             self._partial = ""
         return "\n".join(self._lines)
+
+
+class DisplayNewlines:
+    """Turns "\\r\\n" and lone "\\r" into "\\n" for display, across chunk boundaries.
+
+    rich drops carriage returns, so without this every redraw of a progress
+    bar (brew, curl, pip …) would be glued onto one ever-growing line. Each
+    redraw gets its own line instead, as in a text-mode line reader.
+    """
+
+    def __init__(self) -> None:
+        self._pending_cr = False
+
+    def feed(self, text: str) -> str:
+        if self._pending_cr:
+            text = "\r" + text
+            self._pending_cr = False
+        if text.endswith("\r"):  # might be the first half of a "\r\n" split across chunks
+            text = text[:-1]
+            self._pending_cr = True
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def flush(self) -> str:
+        pending, self._pending_cr = self._pending_cr, False
+        return "\n" if pending else ""
 
 
 def stream(cmd: list[str], env: dict[str, str] | None = None) -> tuple[int, str]:
@@ -321,21 +351,23 @@ def stream(cmd: list[str], env: dict[str, str] | None = None) -> tuple[int, str]
     )
     assert p.stdout is not None
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    display = DisplayNewlines()
     tail = OutputTail(5)
     at_line_start = True
 
     def emit(text: str) -> None:
         nonlocal at_line_start
-        if not text:
-            return
-        console.print(f"[dim]{escape(text)}[/]", end="", highlight=False, emoji=False, soft_wrap=True)
         tail.feed(text)
-        at_line_start = text.endswith("\n")
+        shown = display.feed(text)
+        if not shown:
+            return
+        console.print(f"[dim]{escape(shown)}[/]", end="", highlight=False, emoji=False, soft_wrap=True)
+        at_line_start = shown.endswith("\n")
 
     try:
         while chunk := p.stdout.read1(4096):
             emit(decoder.decode(chunk))
-        emit(decoder.decode(b"", final=True))
+        emit(decoder.decode(b"", final=True) + display.flush())
     except KeyboardInterrupt:
         p.terminate()
         p.wait()

@@ -21,7 +21,7 @@ Exit codes: `0` success or nothing to do; `1` upgrade or check failure, or none 
 - Non-interactive stdin (EOF) counts as cancel; Ctrl-C exits cleanly (130)
 - bun is a standalone install (not brew-managed), so its self-update runs `bun upgrade`; the latest version is looked up from GitHub releases
 - The Linux trio needs root or passwordless sudo to upgrade (`sudo -n` — it never hangs waiting for a password); checking works without root, and the apt index refresh is best-effort
-- apt upgrades run non-interactively: existing config files are kept (`--force-confdef --force-confold`) and the run aborts instead of removing packages (`--no-remove`)
+- apt upgrades keep existing config files (`--force-confdef --force-confold`) and abort instead of removing packages (`--no-remove`); these are command-line options, so they also work through sudo. `DEBIAN_FRONTEND=noninteractive` is set too, but sudo's default `env_reset` drops it, so a remaining debconf question is shown and can be answered
 - Upgrade output is streamed as it arrives, including prompts without a trailing newline, so nothing looks hung and prompts can still be answered
 - pacman only performs a full `-Syu` (Arch does not support partial upgrades) and prefers `checkupdates` (pacman-contrib) when present
 - cargo / gem / mas are out of scope
