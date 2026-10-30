@@ -1,16 +1,18 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["rich"]
+# dependencies = ["rich==14.3.4"]
 # ///
-"""upall — 一键检查并升级本机包管理器（brew / npm / uv / pipx）。
+"""upall — check and upgrade every package manager on this machine in one go.
 
-设计文档：docs/superpowers/specs/2026-07-15-upall-design.md
+Supported: brew, npm, uv, pipx, bun, plus apt / dnf / pacman on Linux.
+Managers that are not installed are skipped automatically.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import re
@@ -18,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -27,18 +30,31 @@ from rich.table import Table
 
 console = Console()
 
-BREW_UPDATE_TIMEOUT = 120  # brew update 最慢（拉 git）
-CMD_TIMEOUT = 30           # 其它子命令
-PYPI_TIMEOUT = 10          # 单个 PyPI 查询
+BREW_UPDATE_TIMEOUT = 120  # `brew update` is the slowest step (it pulls git)
+CMD_TIMEOUT = 30           # every other subcommand
+PYPI_TIMEOUT = 10          # a single PyPI / GitHub lookup
+
+# apt upgrades keep existing config files instead of stopping at dpkg's "keep or
+# replace conffile?" prompt, and abort rather than remove packages. These are
+# command-line options, so they also apply through sudo.
+# DEBIAN_FRONTEND additionally silences debconf questions, but only when it
+# reaches apt: as root it always does; through sudo, the default env_reset
+# drops it, and any remaining prompt is shown and can be answered.
+APT_ENV = {"DEBIAN_FRONTEND": "noninteractive"}
+APT_UPGRADE_OPTS = [
+    "--no-remove",
+    "-o", "Dpkg::Options::=--force-confdef",
+    "-o", "Dpkg::Options::=--force-confold",
+]
 
 
-# ---------- 数据结构 ----------
+# ---------- Data types ----------
 
 @dataclass
 class Outdated:
     pkg: str
     current: str
-    latest: str  # 查询失败时为 "?"
+    latest: str  # "?" when the lookup failed
 
 
 @dataclass
@@ -53,13 +69,13 @@ class UpgradeResult:
     manager: str
     pkg: str
     ok: bool
-    detail: str = ""  # 失败时为输出尾部若干行
+    detail: str = ""  # last few lines of output on failure
 
 
-# ---------- 解析器（纯函数） ----------
+# ---------- Parsers (pure functions) ----------
 
 def parse_brew_outdated(text: str) -> list[Outdated]:
-    """解析 `brew outdated --json=v2`。formula+cask 都要；pinned 排除。"""
+    """Parse `brew outdated --json=v2`: formulae and casks, pinned packages excluded."""
     data = json.loads(text)
     items = []
     for entry in data.get("formulae", []) + data.get("casks", []):
@@ -71,7 +87,7 @@ def parse_brew_outdated(text: str) -> list[Outdated]:
 
 
 def parse_npm_outdated(text: str) -> list[Outdated]:
-    """解析 `npm outdated -g --json`。排除 npm 自身（随 brew node 走）。"""
+    """Parse `npm outdated -g --json`. npm itself is excluded (it ships with brew's node)."""
     data = json.loads(text) if text.strip() else {}
     items = []
     for pkg, info in data.items():
@@ -88,7 +104,7 @@ UV_TOOL_RE = re.compile(r"^(\S+)\s+v(\S+)")
 
 
 def parse_uv_tool_list(text: str) -> list[tuple[str, str]]:
-    """解析 `uv tool list` 文本：`名字 v版本` 行；`- 命令` 行跳过。"""
+    """Parse `uv tool list`: `name vVERSION` lines; `- command` lines are skipped."""
     tools = []
     for line in text.splitlines():
         if line.startswith("-"):
@@ -100,7 +116,7 @@ def parse_uv_tool_list(text: str) -> list[tuple[str, str]]:
 
 
 def parse_pipx_list(text: str) -> list[tuple[str, str]]:
-    """解析 `pipx list --json`。"""
+    """Parse `pipx list --json`."""
     data = json.loads(text)
     out = []
     for venv in data.get("venvs", {}).values():
@@ -113,16 +129,45 @@ def parse_pypi_version(text: str) -> str:
     return json.loads(text)["info"]["version"]
 
 
+_RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
+
+
+def _release_tuple(version: str) -> tuple[int, ...] | None:
+    """Leading numeric release segment of a version: "1.2.3rc1" -> (1, 2, 3)."""
+    m = _RELEASE_RE.match(version.strip().lstrip("vV"))
+    return tuple(int(part) for part in m.group().split(".")) if m else None
+
+
+def installed_is_ahead(current: str, latest: str) -> bool:
+    """True when the installed release number is strictly newer than the "latest" one.
+
+    Covers pre-releases and local builds that are ahead of the published
+    release, which a plain string comparison would report as outdated forever.
+    Versions that can't be parsed are never considered ahead.
+    """
+    cur, lat = _release_tuple(current), _release_tuple(latest)
+    if cur is None or lat is None:
+        return False
+    width = max(len(cur), len(lat))
+    cur += (0,) * (width - len(cur))
+    lat += (0,) * (width - len(lat))
+    return cur > lat
+
+
 def diff_versions(
     installed: list[tuple[str, str]], latest: dict[str, str | None]
 ) -> list[Outdated]:
-    """相等性对比（spec 决策：不引入 packaging）。latest=None → '?' 仅展示。"""
+    """Report packages whose installed version differs from the latest one.
+
+    latest=None means the lookup failed: the package is shown with "?" but
+    never upgraded. Installs that are ahead of the latest release are skipped.
+    """
     items = []
     for pkg, cur in installed:
         lat = latest.get(pkg)
         if lat is None:
             items.append(Outdated(pkg, cur, "?"))
-        elif cur != lat:
+        elif cur != lat and not installed_is_ahead(cur, lat):
             items.append(Outdated(pkg, cur, lat))
     return items
 
@@ -131,7 +176,7 @@ APT_UPGRADABLE_RE = re.compile(r"^(\S+?)/\S+\s+(\S+)\s+\S+\s+\[upgradable from:\
 
 
 def parse_apt_upgradable(text: str) -> list[Outdated]:
-    """解析 `apt list --upgradable`：`包/仓库 最新 架构 [upgradable from: 当前]`。"""
+    """Parse `apt list --upgradable`: `pkg/suite LATEST arch [upgradable from: CURRENT]`."""
     items = []
     for line in text.splitlines():
         m = APT_UPGRADABLE_RE.match(line.strip())
@@ -142,7 +187,7 @@ def parse_apt_upgradable(text: str) -> list[Outdated]:
 
 
 def parse_rpm_qa(text: str) -> dict[str, str]:
-    """解析 `rpm -qa --qf '%{NAME} %{EVR}\\n'` 为 名字→已装版本。"""
+    """Parse `rpm -qa --qf '%{NAME} %{EVR}\\n'` into name -> installed version."""
     installed = {}
     for line in text.splitlines():
         parts = line.split()
@@ -152,12 +197,24 @@ def parse_rpm_qa(text: str) -> dict[str, str]:
 
 
 def parse_dnf_check_update(text: str, installed: dict[str, str]) -> list[Outdated]:
-    """解析 `dnf -q check-update`：`名字.架构 版本 仓库`；Obsoleting 段起忽略。"""
+    """Parse `dnf -q check-update`: `name.arch VERSION repo`; stops at "Obsoleting".
+
+    dnf wraps long package names: the name sits alone on one line and the
+    version + repo follow on the next. Those two lines are joined back up.
+    """
     items = []
+    pending_name: str | None = None
     for line in text.splitlines():
         if line.startswith("Obsoleting"):
             break
         parts = line.split()
+        if pending_name is not None:
+            if len(parts) == 2:
+                parts = [pending_name, *parts]
+            pending_name = None
+        if len(parts) == 1 and "." in parts[0]:
+            pending_name = parts[0]
+            continue
         if len(parts) == 3 and "." in parts[0]:
             name = parts[0].rsplit(".", 1)[0]
             items.append(Outdated(name, installed.get(name, "?"), parts[1]))
@@ -168,7 +225,7 @@ PACMAN_OUTDATED_RE = re.compile(r"^(\S+)\s+(\S+)\s+->\s+(\S+)")
 
 
 def parse_pacman_outdated(text: str) -> list[Outdated]:
-    """解析 `checkupdates` / `pacman -Qu`：`包 旧 -> 新`。"""
+    """Parse `checkupdates` / `pacman -Qu`: `pkg OLD -> NEW`."""
     items = []
     for line in text.splitlines():
         m = PACMAN_OUTDATED_RE.match(line.strip())
@@ -178,14 +235,14 @@ def parse_pacman_outdated(text: str) -> list[Outdated]:
 
 
 def parse_github_release_tag(text: str, prefix: str = "") -> str:
-    """解析 GitHub releases/latest 响应的 tag_name，去掉版本前缀。"""
+    """Return tag_name from a GitHub releases/latest response, minus a version prefix."""
     return json.loads(text)["tag_name"].removeprefix(prefix)
 
 
-# ---------- 网络 ----------
+# ---------- Network ----------
 
 def pypi_latest(pkg: str) -> str | None:
-    """查 PyPI 最新版；任何失败返回 None（调用方显示 ?）。"""
+    """Latest version on PyPI; None on any failure (shown as "?")."""
     url = f"https://pypi.org/pypi/{pkg}/json"
     try:
         with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT) as resp:
@@ -203,7 +260,7 @@ def pypi_latest_many(pkgs: list[str]) -> dict[str, str | None]:
 
 
 def github_latest(repo: str, prefix: str = "") -> str | None:
-    """查 GitHub 最新 release 版本；任何失败返回 None（调用方显示 ?）。"""
+    """Latest GitHub release version; None on any failure (shown as "?")."""
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     req = urllib.request.Request(url, headers={"User-Agent": "upall"})
     try:
@@ -213,41 +270,115 @@ def github_latest(repo: str, prefix: str = "") -> str | None:
         return None
 
 
-# ---------- subprocess helpers ----------
+# ---------- Subprocess helpers ----------
 
 def run(cmd: list[str], timeout: int) -> tuple[int, str, str]:
-    """跑一个命令，返回 (退出码, stdout, stderr)。超时/不存在返回码 -1。"""
+    """Run a command and return (exit code, stdout, stderr); -1 on timeout or missing binary."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
-        return -1, "", f"超时（>{timeout}s）"
+        return -1, "", f"timed out (>{timeout}s)"
     except FileNotFoundError:
-        return -1, "", "命令不存在"
+        return -1, "", "command not found"
 
 
-def stream(cmd: list[str]) -> tuple[int, str]:
-    """跑一个命令并实时弱化显示输出，返回 (退出码, 输出尾部5行)。"""
+class OutputTail:
+    """Keeps the last few complete lines of a streamed output."""
+
+    def __init__(self, size: int = 5) -> None:
+        self._lines: deque[str] = deque(maxlen=size)
+        self._partial = ""
+
+    def feed(self, text: str) -> None:
+        *complete, self._partial = (self._partial + text).split("\n")
+        for line in complete:
+            self._add(line)
+
+    def _add(self, line: str) -> None:
+        # Drop a CRLF line ending first, then keep only the final state of a
+        # progress line that redraws itself with "\r".
+        line = line.rstrip("\r").rsplit("\r", 1)[-1].rstrip()
+        if line:
+            self._lines.append(line)
+
+    def text(self) -> str:
+        if self._partial:
+            self._add(self._partial)
+            self._partial = ""
+        return "\n".join(self._lines)
+
+
+class DisplayNewlines:
+    """Turns "\\r\\n" and lone "\\r" into "\\n" for display, across chunk boundaries.
+
+    rich drops carriage returns, so without this every redraw of a progress
+    bar (brew, curl, pip …) would be glued onto one ever-growing line. Each
+    redraw gets its own line instead, as in a text-mode line reader.
+    """
+
+    def __init__(self) -> None:
+        self._pending_cr = False
+
+    def feed(self, text: str) -> str:
+        if self._pending_cr:
+            text = "\r" + text
+            self._pending_cr = False
+        if text.endswith("\r"):  # might be the first half of a "\r\n" split across chunks
+            text = text[:-1]
+            self._pending_cr = True
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def flush(self) -> str:
+        pending, self._pending_cr = self._pending_cr, False
+        return "\n" if pending else ""
+
+
+def stream(cmd: list[str], env: dict[str, str] | None = None) -> tuple[int, str]:
+    """Run a command, echoing its output dimmed as it arrives; return (exit code, last 5 lines).
+
+    Output is read in raw chunks rather than whole lines, so a prompt that
+    doesn't end in a newline (dpkg's "[Y/n]", a sudo message, ...) shows up
+    immediately instead of the run looking hung. stdin is inherited, so such
+    a prompt can still be answered.
+    """
     console.print(f"[bold cyan]$ {escape(' '.join(cmd))}[/]")
     p = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=None if env is None else {**os.environ, **env},
     )
-    tail: list[str] = []
     assert p.stdout is not None
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    display = DisplayNewlines()
+    tail = OutputTail(5)
+    at_line_start = True
+
+    def emit(text: str) -> None:
+        nonlocal at_line_start
+        tail.feed(text)
+        shown = display.feed(text)
+        if not shown:
+            return
+        console.print(f"[dim]{escape(shown)}[/]", end="", highlight=False, emoji=False, soft_wrap=True)
+        at_line_start = shown.endswith("\n")
+
     try:
-        for line in p.stdout:
-            line = line.rstrip()
-            console.print(f"[dim]{escape(line)}[/]", highlight=False)
-            tail = (tail + [line])[-5:]
+        while chunk := p.stdout.read1(4096):
+            emit(decoder.decode(chunk))
+        emit(decoder.decode(b"", final=True) + display.flush())
     except KeyboardInterrupt:
         p.terminate()
         p.wait()
         raise
-    return p.wait(), "\n".join(tail)
+    if not at_line_start:
+        console.print()
+    return p.wait(), tail.text()
 
 
 def root_prefix() -> list[str]:
-    """Linux 系统级包管理需要 root：非 root 时用免密 sudo（-n 不挂起等密码）。"""
+    """System package managers need root: use passwordless sudo when not root (-n never hangs)."""
     return [] if os.geteuid() == 0 else ["sudo", "-n"]
 
 
@@ -272,17 +403,17 @@ class BrewAdapter(Adapter):
     def check(self) -> CheckResult:
         code, _, err = run(["brew", "update"], timeout=BREW_UPDATE_TIMEOUT)
         if code != 0:
-            return CheckResult(self.name, error=f"brew update 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"brew update failed: {err.strip()[-200:]}")
         code, out, err = run(["brew", "outdated", "--json=v2"], timeout=CMD_TIMEOUT)
         if code != 0:
-            return CheckResult(self.name, error=f"brew outdated 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"brew outdated failed: {err.strip()[-200:]}")
         try:
             return CheckResult(self.name, items=parse_brew_outdated(out))
         except (json.JSONDecodeError, KeyError, TypeError):
-            return CheckResult(self.name, error="brew outdated 输出不是预期 JSON")
+            return CheckResult(self.name, error="brew outdated did not return the expected JSON")
 
     def upgrade(self, pkgs: list[str]) -> list[UpgradeResult]:
-        # 一次传入全部（brew 自己会规划依赖顺序）；失败归因整批
+        # One call for everything (brew orders dependencies itself); a failure fails the batch.
         code, tail = stream(["brew", "upgrade", *pkgs])
         ok = code == 0
         return [UpgradeResult(self.name, p, ok, "" if ok else tail) for p in pkgs]
@@ -293,17 +424,18 @@ class NpmAdapter(Adapter):
 
     def check(self) -> CheckResult:
         code, out, err = run(["npm", "outdated", "-g", "--json"], timeout=CMD_TIMEOUT)
-        # 退出码语义：0=无过期包；1+JSON stdout=有过期包；1+空 stdout=真实错误（勿当"已最新"）
+        # Exit codes: 0 = nothing outdated; 1 + JSON on stdout = some outdated;
+        # 1 + empty stdout = a real error (must not be reported as "up to date").
         if code not in (0, 1) or (code == 1 and not out.strip()):
-            return CheckResult(self.name, error=f"npm outdated 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"npm outdated failed: {err.strip()[-200:]}")
         try:
             return CheckResult(self.name, items=parse_npm_outdated(out))
         except (json.JSONDecodeError, KeyError, TypeError):
-            return CheckResult(self.name, error="npm outdated 输出不是合法 JSON")
+            return CheckResult(self.name, error="npm outdated did not return valid JSON")
 
     def upgrade(self, pkgs: list[str]) -> list[UpgradeResult]:
         results = []
-        for p in pkgs:  # 每包单独执行，便于失败归因
+        for p in pkgs:  # one package per call so failures are attributed correctly
             code, tail = stream(["npm", "install", "-g", f"{p}@latest"])
             results.append(UpgradeResult(self.name, p, code == 0, "" if code == 0 else tail))
         return results
@@ -315,7 +447,7 @@ class UvToolAdapter(Adapter):
     def check(self) -> CheckResult:
         code, out, err = run(["uv", "tool", "list"], timeout=CMD_TIMEOUT)
         if code != 0:
-            return CheckResult(self.name, error=f"uv tool list 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"uv tool list failed: {err.strip()[-200:]}")
         installed = parse_uv_tool_list(out)
         latest = pypi_latest_many([p for p, _ in installed])
         return CheckResult(self.name, items=diff_versions(installed, latest))
@@ -334,11 +466,11 @@ class PipxAdapter(Adapter):
     def check(self) -> CheckResult:
         code, out, err = run(["pipx", "list", "--json"], timeout=CMD_TIMEOUT)
         if code != 0:
-            return CheckResult(self.name, error=f"pipx list 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"pipx list failed: {err.strip()[-200:]}")
         try:
             installed = parse_pipx_list(out)
         except (json.JSONDecodeError, KeyError, TypeError):
-            return CheckResult(self.name, error="pipx list 输出不是预期 JSON")
+            return CheckResult(self.name, error="pipx list did not return the expected JSON")
         latest = pypi_latest_many([p for p, _ in installed])
         return CheckResult(self.name, items=diff_versions(installed, latest))
 
@@ -352,13 +484,13 @@ class PipxAdapter(Adapter):
 
 class BunAdapter(Adapter):
     name = "bun"
-    # bun 为独立安装（~/.bun，非 brew），自更新走 bun upgrade；
-    # 本机未使用 bun 全局包（无 global package.json），故只管 bun 本体。
+    # bun is a standalone install (~/.bun, not brew) that updates itself with
+    # `bun upgrade`. Only bun itself is managed, not bun global packages.
 
     def check(self) -> CheckResult:
         code, out, err = run(["bun", "--version"], timeout=CMD_TIMEOUT)
         if code != 0:
-            return CheckResult(self.name, error=f"bun --version 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"bun --version failed: {err.strip()[-200:]}")
         current = out.strip()
         latest = github_latest("oven-sh/bun", prefix="bun-v")
         return CheckResult(self.name, items=diff_versions([("bun", current)], {"bun": latest}))
@@ -369,9 +501,9 @@ class BunAdapter(Adapter):
 
 
 class LinuxAdapter(Adapter):
-    """Linux 系统包管理器公共基类：仅在 Linux 且命令存在时启用。"""
+    """Base class for Linux system package managers: enabled only on Linux when the binary exists."""
 
-    binary: str = ""  # available() 检测的命令（如 apt 检测 apt-get）
+    binary: str = ""  # binary checked by available() (apt checks apt-get)
 
     def available(self) -> bool:
         return sys.platform.startswith("linux") and shutil.which(self.binary or self.name) is not None
@@ -382,16 +514,19 @@ class AptAdapter(LinuxAdapter):
     binary = "apt-get"
 
     def check(self) -> CheckResult:
-        # 刷新索引尽力而为：非 root 且无免密 sudo 时失败，退回用现有索引（可能略旧）
+        # Index refresh is best effort: without root or passwordless sudo it fails
+        # and the existing (possibly slightly stale) index is used.
         run([*root_prefix(), "apt-get", "update"], timeout=BREW_UPDATE_TIMEOUT)
         code, out, err = run(["apt", "list", "--upgradable"], timeout=CMD_TIMEOUT)
         if code != 0:
-            return CheckResult(self.name, error=f"apt list 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"apt list failed: {err.strip()[-200:]}")
         return CheckResult(self.name, items=parse_apt_upgradable(out))
 
     def upgrade(self, pkgs: list[str]) -> list[UpgradeResult]:
         code, tail = stream(
-            [*root_prefix(), "apt-get", "install", "--only-upgrade", "-y", *pkgs])
+            [*root_prefix(), "apt-get", "install", "--only-upgrade", "-y", *APT_UPGRADE_OPTS, *pkgs],
+            env=APT_ENV,
+        )
         ok = code == 0
         return [UpgradeResult(self.name, p, ok, "" if ok else tail) for p in pkgs]
 
@@ -400,12 +535,12 @@ class DnfAdapter(LinuxAdapter):
     name = "dnf"
 
     def check(self) -> CheckResult:
-        # dnf check-update 退出码：0=无更新，100=有更新，其余=错误
+        # dnf check-update exit codes: 0 = no updates, 100 = updates available, anything else = error
         code, out, err = run(["dnf", "-q", "check-update"], timeout=BREW_UPDATE_TIMEOUT)
         if code == 0:
             return CheckResult(self.name)
         if code != 100:
-            return CheckResult(self.name, error=f"dnf check-update 失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"dnf check-update failed: {err.strip()[-200:]}")
         rc, rpm_out, _ = run(["rpm", "-qa", "--qf", "%{NAME} %{EVR}\n"], timeout=CMD_TIMEOUT)
         installed = parse_rpm_qa(rpm_out) if rc == 0 else {}
         return CheckResult(self.name, items=parse_dnf_check_update(out, installed))
@@ -420,21 +555,23 @@ class PacmanAdapter(LinuxAdapter):
     name = "pacman"
 
     def check(self) -> CheckResult:
-        # 优先 checkupdates（pacman-contrib，免 root 且索引新）；否则 pacman -Qu（用上次同步的索引）
+        # Prefer checkupdates (pacman-contrib: no root, fresh index); otherwise
+        # fall back to pacman -Qu (uses the last synced index).
         if shutil.which("checkupdates"):
             code, out, err = run(["checkupdates"], timeout=BREW_UPDATE_TIMEOUT)
-            if code == 2:  # checkupdates：2 = 无更新
+            if code == 2:  # checkupdates: 2 = no updates
                 return CheckResult(self.name)
         else:
             code, out, err = run(["pacman", "-Qu"], timeout=CMD_TIMEOUT)
-            if code == 1 and not out.strip():  # pacman -Qu：无更新时退出 1 且无输出
+            if code == 1 and not out.strip():  # pacman -Qu: exit 1 with no output = no updates
                 return CheckResult(self.name)
         if code != 0:
-            return CheckResult(self.name, error=f"pacman 检查失败: {err.strip()[-200:]}")
+            return CheckResult(self.name, error=f"pacman check failed: {err.strip()[-200:]}")
         return CheckResult(self.name, items=parse_pacman_outdated(out))
 
     def upgrade(self, pkgs: list[str]) -> list[UpgradeResult]:
-        # Arch 不支持部分升级：一律全量 -Syu，结果归因到列出的包
+        # Arch doesn't support partial upgrades: always run a full -Syu and
+        # attribute the result to the listed packages.
         code, tail = stream([*root_prefix(), "pacman", "-Syu", "--noconfirm"])
         ok = code == 0
         return [UpgradeResult(self.name, p, ok, "" if ok else tail) for p in pkgs]
@@ -449,9 +586,9 @@ ADAPTERS: list[Adapter] = [
 # ---------- Orchestrator ----------
 
 def check_all(adapters: list[Adapter]) -> list[CheckResult]:
-    """并行跑所有 adapter.check()，按 adapters 顺序返回。"""
+    """Run every adapter.check() in parallel; results come back in adapter order."""
     results: dict[str, CheckResult] = {}
-    with console.status("[bold]检查中…[/]") as status:
+    with console.status("[bold]Checking…[/]") as status:
         with ThreadPoolExecutor(max_workers=len(adapters)) as ex:
             futs = {ex.submit(a.check): a for a in adapters}
             done: list[str] = []
@@ -459,24 +596,24 @@ def check_all(adapters: list[Adapter]) -> list[CheckResult]:
                 a = futs[f]
                 try:
                     results[a.name] = f.result()
-                except Exception as e:  # adapter 内部未捕获的意外
+                except Exception as e:  # unexpected error inside an adapter
                     results[a.name] = CheckResult(a.name, error=str(e))
                 done.append(a.name)
-                status.update(f"[bold]检查中… 已完成: {', '.join(done)}[/]")
+                status.update(f"[bold]Checking… done: {', '.join(done)}[/]")
     return [results[a.name] for a in adapters]
 
 
 def render_table(results: list[CheckResult]) -> None:
-    table = Table(title="过期包检查")
-    table.add_column("管理器", style="bold")
-    table.add_column("包")
-    table.add_column("当前")
-    table.add_column("最新", style="green")
+    table = Table(title="Outdated packages")
+    table.add_column("Manager", style="bold")
+    table.add_column("Package")
+    table.add_column("Current")
+    table.add_column("Latest", style="green")
     for r in results:
         if r.error:
-            table.add_row(r.manager, f"[yellow]⚠️  检查失败: {escape(r.error)}[/]", "", "")
+            table.add_row(r.manager, f"[yellow]⚠️  check failed: {escape(r.error)}[/]", "", "")
         elif not r.items:
-            table.add_row(r.manager, "[dim]✓ 已最新[/]", "", "")
+            table.add_row(r.manager, "[dim]✓ up to date[/]", "", "")
         else:
             for it in r.items:
                 latest = escape(it.latest) if it.latest != "?" else "[yellow]?[/]"
@@ -488,13 +625,15 @@ def render_table(results: list[CheckResult]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="upall", description="一键检查并升级本机包管理器（brew/npm/uv/pipx/bun + Linux: apt/dnf/pacman）"
+        prog="upall",
+        description="Check and upgrade every package manager on this machine "
+                    "(brew/npm/uv/pipx/bun, plus apt/dnf/pacman on Linux)",
     )
-    parser.add_argument("-y", "--yes", action="store_true", help="跳过确认直接升级")
+    parser.add_argument("-y", "--yes", action="store_true", help="upgrade without asking for confirmation")
     parser.add_argument("--check", action="store_true",
-                        help="只检查不升级（与 -y 同给时 --check 优先）")
+                        help="check only, never upgrade (wins over -y)")
     parser.add_argument("managers", nargs="*", metavar="manager",
-                        help="只处理指定管理器：brew npm uv pipx bun apt dnf pacman")
+                        help="only handle these managers: brew npm uv pipx bun apt dnf pacman")
     args = parser.parse_args()
 
     by_name = {a.name: a for a in ADAPTERS}
@@ -502,22 +641,29 @@ def main() -> int:
         unknown = sorted(set(args.managers) - set(by_name))
         if unknown:
             console.print(
-                f"[red]未知管理器: {escape(', '.join(unknown))}（可选: {', '.join(by_name)}）[/]")
+                f"[red]Unknown manager(s): {escape(', '.join(unknown))} (choose from: {', '.join(by_name)})[/]")
             return 2
-        selected = [a for a in ADAPTERS if a.name in args.managers]
+        requested = [a for a in ADAPTERS if a.name in args.managers]
     else:
-        selected = list(ADAPTERS)
+        requested = list(ADAPTERS)
 
-    selected = [a for a in selected if a.available()]
+    selected = [a for a in requested if a.available()]
+    if args.managers:
+        missing = [a.name for a in requested if a not in selected]
+        if missing:
+            console.print(
+                f"[yellow]Not installed or not supported on this system: {escape(', '.join(missing))}[/]")
+        if not selected:
+            return 1
     if not selected:
-        console.print("[yellow]没有可用的包管理器[/]")
+        console.print("[yellow]No supported package managers found[/]")
         return 0
 
     results = check_all(selected)
     render_table(results)
 
     check_failed = any(r.error for r in results)
-    # latest == "?"（PyPI 查询失败）仅展示，不纳入升级
+    # latest == "?" (lookup failed) is shown only, never upgraded
     upgradable = {
         r.manager: [i.pkg for i in r.items if i.latest != "?"]
         for r in results if not r.error
@@ -526,7 +672,7 @@ def main() -> int:
 
     if total == 0:
         if not check_failed:
-            console.print("[green]✅ 全部已是最新[/]")
+            console.print("[green]✅ Everything is up to date[/]")
         return 1 if check_failed else 0
 
     if args.check:
@@ -534,28 +680,28 @@ def main() -> int:
 
     if not args.yes:
         try:
-            resp = console.input(f"[bold]升级全部 {total} 个包？{escape('[y/N]')} [/]")
-        except EOFError:  # 非交互（cron / < /dev/null）视同取消
+            resp = console.input(f"[bold]Upgrade all {total} package(s)? {escape('[y/N]')} [/]")
+        except EOFError:  # non-interactive stdin (cron, < /dev/null) counts as cancel
             resp = ""
         if resp.strip().lower() not in ("y", "yes"):
-            console.print("已取消")
+            console.print("Cancelled")
             return 1 if check_failed else 0
 
     all_results: list[UpgradeResult] = []
-    for a in selected:  # 顺序升级：规避 brew/npm 锁并发问题
+    for a in selected:  # sequential on purpose: avoids brew/npm lock contention
         pkgs = upgradable.get(a.name, [])
         if pkgs:
             console.rule(f"[bold]{a.name}[/]")
             try:
                 all_results.extend(a.upgrade(pkgs))
-            except Exception as e:  # 与 check_all 对称的兜底，保证汇总环节总能执行
+            except Exception as e:  # mirrors check_all: the summary must always run
                 all_results.extend(
                     UpgradeResult(a.name, p, False, str(e)) for p in pkgs
                 )
 
     failed = [r for r in all_results if not r.ok]
-    console.rule("[bold]结果[/]")
-    console.print(f"成功 [green]{len(all_results) - len(failed)}[/] / 失败 [red]{len(failed)}[/]")
+    console.rule("[bold]Summary[/]")
+    console.print(f"Succeeded [green]{len(all_results) - len(failed)}[/] / failed [red]{len(failed)}[/]")
     for r in failed:
         console.print(f"[red]✗ {r.manager}: {escape(r.pkg)}[/]")
         if r.detail:
@@ -567,5 +713,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        console.print("\n[yellow]已中断[/]")
+        console.print("\n[yellow]Interrupted[/]")
         sys.exit(130)
